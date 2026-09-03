@@ -1,15 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-trap 'printf "%s\n" "Installation stopped. Read the error above." >&2' ERR
-
-die() {
-  printf '%s\n' "$*" >&2
-  exit 1
-}
-
 REPO='jtrainer-tebra/tebra-saas-design-lab'
 TARGET="$HOME/Tebra SaaS Design Lab"
+STAGING="$HOME/Tebra SaaS Design Lab.installing"
+STAGING_CLAIMED=0
 GH_VERSION='2.99.0'
 GH_ARCHIVE="gh_${GH_VERSION}_macOS_arm64.zip"
 GH_SHA256='94d4bd7e88563a9cb414e651e88acc4f1728a87476752460906d824230748d37'
@@ -19,6 +14,22 @@ OWNED_PATHS=(
   'packages/web/flow-backups'
   'tolaria-vault'
 )
+
+cleanup_staging() {
+  [[ "$STAGING_CLAIMED" == 1 ]] || return 0
+  [[ -n "${HOME:-}" && "$STAGING" == "$HOME/Tebra SaaS Design Lab.installing" && "$STAGING" != "$HOME" ]] || return 0
+  if [[ -e "$STAGING" ]]; then
+    rm -rf -- "$STAGING"
+  fi
+}
+
+die() {
+  cleanup_staging
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+trap 'cleanup_staging; printf "%s\n" "Installation stopped. Read the error above." >&2' ERR
 
 [[ $# -le 1 ]] || die 'Use one old Lab folder or find.'
 
@@ -72,10 +83,40 @@ if ! "$GH" repo view "$REPO" --json name >/dev/null 2>&1; then
   die "GitHub user $LOGIN does not have access to the Lab yet. Send that username to Jay."
 fi
 
-printf '%s\n' 'Cloning your Lab.'
+OLD="${1:-}"
+if [[ "$OLD" == 'find' ]]; then
+  printf '%s\n' 'Finding your old Lab.'
+  MATCHES=()
+  while IFS= read -r RELEASE; do
+    if grep -Eq '"channel"[[:space:]]*:[[:space:]]*"tebra-saas"' "$RELEASE"; then
+      MATCHES+=("${RELEASE%/lab-release.json}")
+    fi
+  done < <(find "$HOME" -maxdepth 4 -name lab-release.json -not -path "$TARGET/*" -not -path "$STAGING/*" 2>/dev/null)
+  if [[ ${#MATCHES[@]} -ne 1 ]]; then
+    if [[ ${#MATCHES[@]} -eq 0 ]]; then
+      printf '%s\n' 'No Tebra SaaS Lab folder was found.'
+    else
+      printf '%s\n' "Found these Tebra SaaS Lab folders: ${MATCHES[*]}"
+    fi
+    die 'Re-run this installer with your Lab folder path in place of find.'
+  fi
+  OLD="${MATCHES[0]}"
+  printf '%s\n' "Using old Lab at $OLD."
+elif [[ -n "$OLD" ]]; then
+  [[ -d "$OLD" && -f "$OLD/lab-release.json" ]] || die "Old Lab folder is not a Lab: $OLD"
+  grep -Eq '"channel"[[:space:]]*:[[:space:]]*"tebra-saas"' "$OLD/lab-release.json" || die "Old Lab folder is not a Tebra SaaS Lab: $OLD"
+fi
+
 [[ ! -e "$TARGET" ]] || die 'There is already a Lab at that path. Open it, or move it aside first.'
-"$GH" repo clone "$REPO" "$TARGET"
-cd "$TARGET"
+if lsof -ti :3001 >/dev/null 2>&1; then
+  die "Port 3001 is in use. Close the Lab's Terminal window first, then run this again."
+fi
+
+STAGING_CLAIMED=1
+cleanup_staging
+printf '%s\n' 'Cloning your Lab.'
+"$GH" repo clone "$REPO" "$STAGING"
+cd "$STAGING"
 git switch -c lab/workspace
 git config --local user.name "$LOGIN"
 git config --local user.email "$LOGIN@users.noreply.github.com"
@@ -93,35 +134,8 @@ CI=true pnpm install --frozen-lockfile
 printf '%s\n' 'Checking the Lab.'
 pnpm --filter @nitro-alpha/web test:design-mode
 
-OLD="${1:-}"
-if [[ "$OLD" == 'find' ]]; then
-  printf '%s\n' 'Finding your old Lab.'
-  MATCHES=()
-  while IFS= read -r RELEASE; do
-    if grep -Eq '"channel"[[:space:]]*:[[:space:]]*"tebra-saas"' "$RELEASE"; then
-      MATCHES+=("${RELEASE%/lab-release.json}")
-    fi
-  done < <(find "$HOME" -maxdepth 4 -name lab-release.json -not -path "$TARGET/*" 2>/dev/null)
-  if [[ ${#MATCHES[@]} -ne 1 ]]; then
-    if [[ ${#MATCHES[@]} -eq 0 ]]; then
-      printf '%s\n' 'No Tebra SaaS Lab folder was found.'
-    else
-      printf '%s\n' "Found these Tebra SaaS Lab folders: ${MATCHES[*]}"
-    fi
-    die 'tell Jay which folder is your Lab.'
-  fi
-  OLD="${MATCHES[0]}"
-  printf '%s\n' "Using old Lab at $OLD."
-elif [[ -n "$OLD" ]]; then
-  [[ -d "$OLD" && -f "$OLD/lab-release.json" ]] || die "Old Lab folder is not a Lab: $OLD"
-  grep -Eq '"channel"[[:space:]]*:[[:space:]]*"tebra-saas"' "$OLD/lab-release.json" || die "Old Lab folder is not a Tebra SaaS Lab: $OLD"
-fi
-
 if [[ -n "$OLD" ]]; then
   printf '%s\n' 'Copying your designer work into the new Lab.'
-  if lsof -ti :3001 >/dev/null 2>&1; then
-    die "Close the old Lab's Terminal window first, then run this again."
-  fi
   INVENTORY="$(mktemp)"
   (
     cd "$OLD"
@@ -131,24 +145,28 @@ if [[ -n "$OLD" ]]; then
   ) > "$INVENTORY"
   for OWNED_PATH in "${OWNED_PATHS[@]}"; do
     if [[ -e "$OLD/$OWNED_PATH" ]]; then
-      mkdir -p "$TARGET/$(dirname "$OWNED_PATH")"
-      ditto "$OLD/$OWNED_PATH" "$TARGET/$OWNED_PATH"
+      mkdir -p "$STAGING/$(dirname "$OWNED_PATH")"
+      ditto "$OLD/$OWNED_PATH" "$STAGING/$OWNED_PATH"
     fi
   done
-  if ! (cd "$TARGET" && shasum -a 256 -c "$INVENTORY"); then
+  if ! (cd "$STAGING" && shasum -a 256 -c "$INVENTORY"); then
     rm -f "$INVENTORY"
     die 'Migration hash check failed for a file named above.'
   fi
   rm -f "$INVENTORY"
-  pnpm --filter @nitro-alpha/web flows:build
   printf '%s\n' "Your old Lab folder is untouched at $OLD. Keep it for a week, then it can go in the Trash."
 fi
 
+pnpm --filter @nitro-alpha/web flows:build
 printf '%s\n' 'Checking the installed Lab.'
 if ! runtime/node/bin/node scripts/lab/update.mjs --doctor; then
   die 'The Lab doctor could not complete repairs.'
 fi
 
+[[ ! -e "$TARGET" ]] || die 'There is already a Lab at that path. Open it, or move it aside first.'
+mv "$STAGING" "$TARGET"
+STAGING_CLAIMED=0
+trap - ERR
 printf '%s\n' 'Opening your Lab.'
 open "$TARGET/start-lab.command"
 printf '%s\n' 'Your Lab is starting and will open in your browser. The folder is ~/Tebra SaaS Design Lab.'
