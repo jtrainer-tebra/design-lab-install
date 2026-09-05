@@ -159,7 +159,7 @@ fi
 
 pnpm --filter @nitro-alpha/web flows:build
 printf '%s\n' 'Checking the installed Lab.'
-if ! runtime/node/bin/node scripts/lab/update.mjs --doctor; then
+if ! NEXT_PUBLIC_DESIGN_MODE=1 runtime/node/bin/node scripts/lab/update.mjs --doctor; then
   die 'The Lab doctor could not complete repairs.'
 fi
 
